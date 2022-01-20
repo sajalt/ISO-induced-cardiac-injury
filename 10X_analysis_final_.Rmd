@@ -1,6 +1,6 @@
 ---
 title: "10X Iso Injection Final Analysis"
-author: "Sajal Tiwary"
+author: 
 date: "2/12/2021"
 output: html_document
 ---
@@ -33,7 +33,7 @@ library(ggrepel)
 library(hash)
 library(Matrix.utils)
 library(ComplexHeatmap)
-setwd('C:/Users/stiwary/Desktop')
+setwd('C:/Users/Desktop')
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
