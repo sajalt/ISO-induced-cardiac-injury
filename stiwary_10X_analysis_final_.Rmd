@@ -1,0 +1,329 @@
+---
+title: "10X Iso Injection Final Analysis"
+author: "Sajal Tiwary"
+date: "2/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(htmltools)
+library(Seurat)
+library(dplyr)
+library(stringr)
+library(Matrix)
+library(umap)
+library(tsne)
+library(metap)
+library(cowplot)
+library(patchwork)
+library(BiocManager)
+library(rvest)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(data.table)
+library(openxlsx)
+library(GSEABase)
+library(clustree)
+library(VennDiagram)
+library(RColorBrewer)
+library(rrvgo)
+library(gplots)
+library(ggrepel)
+library(hash)
+library(Matrix.utils)
+library(ComplexHeatmap)
+setwd('C:/Users/stiwary/Desktop')
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+#Seurat object setup and timepoint ident assignment
+```{r}
+#would like to read in both datasets and merge overlapping features but unsure of how to do that. Changing unique.features unsuccessful
+
+setwd('C:/Users/stiwary/Desktop')
+heart_matrix <- Read10X(data.dir = c('mouse H day 0-2-7 heart 1','mouse H day 0-2-7 heart 2'), unique.features = TRUE)
+
+heart_aggregate <- heart_matrix$`Gene Expression`
+
+#same oligos for hashtag antibodies in each library, so pool
+heart1_GE_htos <- read.csv(file = "final_cell_barcodes_heart1.csv", nrows = 3)
+heart2_GE_htos <- read.csv(file = "final_cell_barcodes_heart2.csv", nrows = 3)
+heart_GE_htos <- cbind(heart1_GE_htos, heart2_GE_htos)
+rownames(heart_GE_htos) <- c('day 2', 'day 7', 'baseline')
+
+# Confirm that the HTO have the correct names
+rownames(heart_GE_htos)
+
+#reformatting for gsub()
+colnames(heart_aggregate) <- gsub(x = as.character(colnames(heart_aggregate)), pattern = "-1", replacement = ".1")
+colnames(heart_aggregate) <- sub("2_", "", colnames(heart_aggregate))
+colnames(heart_aggregate) <- str_remove(colnames(heart_aggregate), "2-")
+joint.bcs <- intersect(colnames(heart_aggregate), colnames(heart_GE_htos))
+
+#confirm that length(joint.bcs) = length(colnames(heart_aggregate))
+
+# reformat to only include hashtagged cells
+heart_aggregate <- heart_aggregate[, joint.bcs]
+heart_GE_htos <- as.matrix(heart_GE_htos[, joint.bcs])
+
+#make the Seurat object and distinguish the mitochondrial DNA in a metadata slot
+heart_GE <- CreateSeuratObject(
+  counts = heart_aggregate, project = 'heart', min.cells = 10, min.features = 500)
+heart_GE[['percent.mt']] <- PercentageFeatureSet(heart_GE, pattern = "^mt-")
+
+#matching HTO count matrix to cleaned and scaled Seurat object
+barcodes_post_clean <- 
+  intersect(rownames(as.matrix(heart_GE$nCount_RNA)), colnames(heart_GE_htos))
+heart_GE_htos <- heart_GE_htos[,barcodes_post_clean]
+
+#add to metadata, normalize
+heart_GE[["HTO"]] <- CreateAssayObject(counts = heart_GE_htos)
+heart_GE <- NormalizeData(heart_GE, assay = "HTO", normalization.method = "CLR")
+
+#Demultiplex using HTO assay data
+heart_GE <- HTODemux(heart_GE, assay = "HTO", positive.quantile = 0.99)
+
+#verify singlet yield
+table(heart_GE$HTO_classification.global)
+
+#visualize
+VlnPlot(heart_GE, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+HTOHeatmap(heart_GE, assay = "HTO", ncells = 5000)
+
+#setting idents to the HTO labels for negative and doublet removal
+Idents(heart_GE) <- "HTO_classification.global"
+dont_want <- c("Negative", "Doublet")
+heart_GE <- subset(heart_GE, idents = dont_want, invert = TRUE)
+
+#integration steps all done per Seurat integrated dataset tutorial
+#split by HTO max ID 
+heart_GE_list <- SplitObject(heart_GE, split.by = "HTO_maxID")
+for(i in 1:length(heart_GE_list)) {
+  heart_GE_list[[i]] <- SCTransform(heart_GE_list[[i]], verbose = FALSE, vars.to.regress = "percent.mt")
+}
+```
+
+#Integration across time points followed by PCA and UMAP
+```{r}
+#follow steps for integrating by first finding variable features overall, then finding anchors between time points and integrating
+
+#if have lots of features then need to allow more RAM for global variables 
+options(future.globals.maxSize = 1000 * 1024^2)
+
+#set assay as SCT so don't have to specify repeatedly. Which I did anyway just to be safe
+lapply(heart_GE_list, function(x) {DefaultAssay(x) <- "SCT"})
+
+heart_GE_features <- SelectIntegrationFeatures(object.list = heart_GE_list, nfeatures = 3000)
+heart_GE_list <- PrepSCTIntegration(object.list = heart_GE_list, anchor.features = heart_GE_features, verbose = FALSE)
+
+heart_GE_anchors <- FindIntegrationAnchors(object.list = heart_GE_list, normalization.method = "SCT", anchor.features = heart_GE_features, verbose = FALSE)
+heart_GE_integrated <- IntegrateData(anchorset = heart_GE_anchors, normalization.method = "SCT", verbose = FALSE, dims = 1:29)
+
+#set assay as integrated so don't have to specify repeatedly. Which I did anyway just to be safe
+DefaultAssay(heart_GE_integrated) <- "integrated"
+
+#PCA and clustering on integrated dataset
+#p value quickly went down, only first ~15 components were significant... maybe I should reduce this?
+heart_GE_integrated <- RunPCA(heart_GE_integrated, verbose = FALSE, assay = "integrated") 
+heart_GE_integrated <- RunTSNE(heart_GE_integrated, verbose = FALSE, assay = "integrated")
+heart_GE_integrated<- JackStraw(heart_GE_integrated, num.replicate = 100, dims = 50)
+heart_GE_integrated <- ScoreJackStraw(heart_GE_integrated, dims = 1:50)
+JackStrawPlot(heart_GE_integrated, dims = 1:50)
+
+#retaining 0.3 resolution to get the appropriate number of clusters that we're comfortable identifying
+heart_GE_integrated <- FindNeighbors(heart_GE_integrated, verbose = FALSE, assay = "integrated", dims = 1:15)
+heart_GE_integrated <- FindClusters(heart_GE_integrated, resolution = 0.25, assay = "integrated")
+
+#clustree again to see how many clusters we get across resolutions
+clustree(heart_GE_integrated, prefix = "integrated_snn_res.")
+
+heart_GE_integrated <- RunUMAP(heart_GE_integrated, dims = 1:15, assay = "integrated")
+DimPlot(heart_GE_integrated, split.by = "HTO_maxID", combine = FALSE, label = TRUE)
+```
+
+#Cluster markers and labeling
+```{r}
+#find markers for the clusters, just take top 20
+#do some feature plots for further cluster identification
+DefaultAssay(heart_GE_integrated) <- "integrated"
+Idents(heart_GE_integrated) <- heart_GE_integrated$seurat_clusters
+
+heart_GE_markers_integrated <- FindAllMarkers(heart_GE_integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "integrated")
+
+top20_integrated <- heart_GE_markers_integrated %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+
+#one of the clusters was very strange, had to investigate further
+#cluster4_markers <- FindConservedMarkers(heart_GE_integrated, assay = "integrated", ident.1 = 4, grouping.var = "HTO_maxID", verbose = FALSE)
+#write.xlsx(cluster4_markers, "C:/Users/stiwary/Desktop/weird cluster markers.xlsx", row.names = TRUE)
+
+FeaturePlot(heart_GE_integrated, features = "Ccr2", split.by = 'HTO_maxID', blend = FALSE, slot = "scale.data", min.cutoff = 0)
+
+write.xlsx(top20_integrated, "C:/Users/stiwary/Desktop/integrated cluster markers.xlsx", row.names = TRUE)
+
+#rename clusters
+Idents(heart_GE_integrated) <- heart_GE_integrated$seurat_clusters
+
+#combine clusters that are the same
+#create metadata column to hold permanent cluster name for each cell
+heart_GE_integrated <- AddMetaData(object = heart_GE_integrated, metadata = NA, col.name = 'cluster_name')
+
+#label the clusters for idents
+cell_types_integrated <- c("LYVE1- Macrophages", "B cells", "Dendritic cells", "Monocytes", "Stromal cells", "Granulocytes", "CCR2-/LYVE1+ Macrophages", "IFN activated macrophages", "T cells", "NK cells")
+names(cell_types_integrated) <- levels(heart_GE_integrated)
+heart_GE_integrated <- RenameIdents(heart_GE_integrated, cell_types_integrated)
+heart_GE_integrated$cluster_name <- Idents(heart_GE_integrated)
+
+#put idents into the cluster_name slot so that don't lose it
+heart_GE_integrated$cluster_name <- Idents(heart_GE_integrated)
+
+Idents(heart_GE_integrated) <- heart_GE_integrated$cluster_name
+DimPlot(heart_GE_integrated, reduction = "umap", label = FALSE, pt.size = 1, split.by = "HTO_maxID", cols = c("maroon", "darkkhaki", "dark blue", "cyan", "grey", "coral1", "chartreuse4", "gold", "purple", "aquamarine2"))
+```
+
+#Cell counts for each cluster
+```{r}
+#getting cell counts for each cluster--this is an example for number of cells in cluster 0 in the entire heart_GE object
+#for total cell count
+
+#for number of cells in one cluster
+
+#first split into three objects
+Idents(heart_GE_integrated) <- heart_GE_integrated$HTO_maxID
+heart_GE_integrated_day7 <- subset(heart_GE_integrated, idents = 'day 7')
+heart_GE_integrated_day2 <- subset(heart_GE_integrated, idents = 'day 2')
+heart_GE_integrated_baseline <- subset(heart_GE_integrated, idents = 'baseline')
+
+#split each by cluster type, then can just look at cells within each sub object to get total for that cluster at that time point
+table(heart_GE_integrated_baseline$cluster_name)
+table(heart_GE_integrated_day2$cluster_name)
+table(heart_GE_integrated_day7$cluster_name)
+
+#enter these manually into the csv because the ggplot is finnicky about its input
+setwd('C:/Users/stiwary/Desktop')
+
+cell_counts_integrated <- read.csv(file = 'cell_counts_integrated.csv')
+
+ggplot(data = cell_counts_integrated, aes(x = Day, y = Cell.type,label = NULL)) + geom_point(aes(size = Count)) + scale_size(range = c(0.5,30)) + theme(axis.text=element_text(size = 20,face = "bold"))
+```
+
+#usual scRNA-seq workflow for DEGs
+```{r}
+#according to https://satijalab.org/seurat/faq, should do the DEG analysis on the RNA slot, not the SCT or integrated slots
+#so we need to normalize and clean the RNA slot data
+
+#identifying mitochondrial DNA for later subsetting
+DefaultAssay(heart_GE_integrated) <- "RNA"
+
+heart_GE_integrated[['percent.mt']] <- PercentageFeatureSet(heart_GE, pattern = "^mt-")
+
+#visualization for cleaning
+VlnPlot(heart_GE_integrated, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+plot1 <- FeatureScatter(heart_GE_integrated, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(heart_GE_integrated, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+#Adamo 2020 says "0.05%" as percent.mt cutoff, which is likely a typo as that would basically rule out any cell with mitochondria
+#I think it should be 7 based on the violin plot 
+#using 200 and 5000 as boundaries per https://www.ahajournals.org/doi/suppl/10.1161/CIRCULATIONAHA.119.041694
+#this paper also used 12.5% as the mtDNA cutoff... experimenting. That seems high to me. 
+#looking at the violin plots I'm going back to 7%. 12.5% is ridiculous, it includes all kinds of junk and I got mt genes in my DEs
+
+heart_GE_integrated <- subset(heart_GE_integrated, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 7)
+
+#normalize to account for over-represenation of single features
+#parameters from Adamo 2020 and Martini 2019 paper in Circulation
+heart_GE_integrated <- NormalizeData(heart_GE_integrated, assay = "RNA")
+
+#Scaling data in RNA slot as well
+mean_cutoff = c(0.0125, 3)
+disp_cutoff = c(0.5, Inf)
+heart_GE_integrated <- FindVariableFeatures(
+  heart_GE_integrated, selection.method = 'vst', mean.cutoff = mean_cutoff, dispersion.cutoff = disp_cutoff, assay = "RNA")
+top10 <- head(VariableFeatures(heart_GE_integrated), 3000)
+
+#visualize 
+plot3 <- VariableFeaturePlot(heart_GE_integrated, assay = "RNA")
+plot4 <- LabelPoints(plot = plot3, points = top10, repel = TRUE, xnudge = 0, ynudge = 0)
+#plot4
+
+#scaling data for feature over-representation
+all.genes.integrated <- rownames(heart_GE_integrated)
+heart_GE_integrated <- ScaleData(heart_GE_integrated, features = all.genes.integrated, assay = "RNA")
+
+#make list of Seurat objects distinguished by cluster ID
+#merge clusters that ended up being assigned the same ID
+heart_GE_integrated_clusters_list <- SplitObject(heart_GE_integrated, split.by = "cluster_name")
+
+#iterate through the list and find DEGs for each
+cluster_scDGE <- function(x) {
+Idents(x) <- x$HTO_maxID
+#DEGs based on settings from Adamo 2020
+#I decided to cast a broader net and look at all genes including ones with low expression levels (PD-1 has low expression)
+SCDE_BL_2 <- FindMarkers(x, ident.1 = 'day 2', ident.2 = 'baseline', verbose = FALSE, test.use = 'MAST', min.pct = 0, logfc.threshold = 0.25, assay = "RNA")
+SCDE_BL_7 <- FindMarkers(x, ident.1 = 'day 7', ident.2 = 'baseline', verbose = FALSE, test.use = 'MAST', min.pct = 0, logfc.threshold = 0.25, assay = "RNA")
+
+#Selecting only significant genes
+sig_SCDE_BL_2 <- subset(SCDE_BL_2, SCDE_BL_2$p_val_adj < 0.05)
+sig_SCDE_BL_7 <- subset(SCDE_BL_7, SCDE_BL_7$p_val_adj < 0.05)
+
+return(list(sig_SCDE_BL_2, sig_SCDE_BL_7))
+}
+
+heart_GE_int_scDGE <- lapply(heart_GE_integrated_clusters_list, cluster_scDGE)
+```
+
+#looking at overlaps in gene expression changes at day 2 vs day 7
+#doing this in list format didn't work for some reason so just brute forced it
+```{r}
+day2_venn <- rownames(heart_GE_int_scDGE$`Adgre1+ Macrophages`[[1]])
+day7_venn <- rownames(heart_GE_int_scDGE$`Adgre1+ Macrophages`[[2]])
+
+colors <- c('3', '2')
+venn <- venn.diagram(x = list(day2_venn, day7_venn), 
+                     category.names = c("Day 2 vs. BL", "Day 7 vs. BL"), 
+                     filename = NULL, 
+                     #format category text
+                     cat.cex = 1.5, cat.fontface = 'bold', cat.fontfamily = 'sans', cat.pos = c(200, 150),
+                     #format number text
+                     cex = 3.5, fontfamily = 'sans',
+                     #rotation.degree = 180,
+                     #keep day 2 on the left and day 7 on the right
+                     #inverted = TRUE,
+                     #format circles
+                     fill = colors)
+grid.draw(venn)
+```
+
+#now analysis: first do GO and cleanup terms for day 2 and for day 7 to get a general idea of functional changes
+#do heat map, extract dendrogram and do GO of specific clusters of activity
+```{r}
+DGE_heatmap <- function(x) {
+  
+  #exclude clusters with too few DGEs to have meaningful analysis
+  if(length(rownames(x[[1]])) < 3 | length(rownames(x[[2]])) < 3) {return(NA)}
+  else {
+  day2 <- x[[1]]
+  day2_genes <- rownames(day2)
+  day7 <- x[[2]]
+  day7_genes <- rownames(day7)
+  day2_mat <- matrix(day2$avg_log2FC, dimnames = list(day2_genes))
+  day7_mat <- matrix(day7$avg_log2FC, dimnames = list(day7_genes))
+  
+  #heatmaps for day2 and day7
+  #cluster each by logFC and split into 10 clusters. row_km_repeats = 5 will run the kmeans splitting 5 times to get a   consensus kmeans clustering, to reduce variation in clusters with repeated runs
+  day2_heat <- pheatmap(day2_mat, cluster_rows = TRUE, cluster_cols = FALSE,
+                        na_col = "black", color = colorRampPalette(c("dark blue", "yellow"))(50))
+  day7_heat <- pheatmap(day7_mat, cluster_rows = TRUE, cluster_cols = FALSE,
+                        na_col = "black", color = colorRampPalette(c("dark blue", "yellow"))(50))
+  
+  #
+  
+  return(list("day2_map" = day2_heat, "day7_map" = day7_heat))
+  }
+}
+
+heart_GE_int_DE_heat <- lapply(heart_GE_int_scDGE, DGE_heatmap)
+```
+

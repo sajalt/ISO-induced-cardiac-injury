@@ -1,0 +1,248 @@
+---
+title: "WGCNA Sandeep scripted edited"
+author: "Sajal Tiwary"
+date: "8/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(WGCNA)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library("vegan")
+library("collections")
+library(openxlsx)
+library(flashClust)
+library(clusterProfiler)
+library(rrvgo)
+```
+
+#data entry and cleaning
+```{r}
+setwd("C:/Users/stiwary/Documents")
+heart_DEGs <- readRDS('heart_DEGs.rds')
+counts <- readRDS('counts_by_cluster.rds')
+
+#only clusters of interest
+heart_DEGs <- list("LYVE1-" = heart_DEGs$`LYVE1- Macrophages`, 
+                   "LYVE1+" = heart_DEGs$`CCR2-/LYVE1+ Macrophages`, 
+                   "DC" = heart_DEGs$`Dendritic cells`)
+counts <- list("LYVE1-" = counts$`LYVE1- Macrophages`, 
+               "LYVE1+" = counts$`CCR2-/LYVE1+ Macrophages`, 
+               "DC" = counts$`Dendritic cells`)
+
+#remove cells with fewer than 10% positive reads across genes
+counts_cleaned <- lapply(counts, function(x){
+                    lapply(x, function(y){
+                        raw <- y[[1]]
+                        scaled <- y[[2]]
+                        indices <- NULL
+                        for(i in 1:length(rownames(raw))){
+                                if((sum(raw[i,] > 0) / length(colnames(raw))) >= 0.1){
+                                        indices <- c(indices, i)
+                                }
+                        }
+                      return("scaled" = scaled[indices,])
+        })
+})
+
+DEGs <- lapply(heart_DEGs, function(x){
+        lapply(x, function(y){
+                genes <- rownames(y)
+                return(genes)
+        })
+})
+
+DE_counts_2 <- list("LYVE1-" = counts_cleaned$`LYVE1-`$`day 2`, 
+                    "LYVE1+" = counts_cleaned$`LYVE1+`$`day 2`,
+                    "DC" = counts_cleaned$DC$`day 2`)
+
+DE_counts_7 <- list("LYVE1-" = counts_cleaned$`LYVE1-`$`day 7`, 
+                    "LYVE1+" = counts_cleaned$`LYVE1+`$`day 7`,
+                    "DC" = counts_cleaned$DC$`day 7`)
+
+for(i in 1:3){
+        all <- DE_counts_2[[1]]
+        DE_counts_2[[i]] <- DE_counts_2[[i]][rownames(DE_counts_2[[i]]) %in% DEGs[[i]][[1]],]
+        DE_counts_7[[i]] <- DE_counts_7[[i]][rownames(DE_counts_7[[i]]) %in% DEGs[[i]][[2]],]
+}
+
+```
+
+
+#WGCNA script from Sandeep
+#not lapplying through list because each cluster requires a different soft threshold
+```{r}
+## Loading data for LYVE1- Day 0 and Day 2 differentially expressed genes 
+datExpr1<-t(DE_counts_7$`DC`)
+gsg = goodSamplesGenes(datExpr1, verbose = 3);
+gsg$allOK
+
+## Cluster the samples to see obvious outliers
+sampleTree = hclust(dist(datExpr1), method = "average");
+sizeGrWindow(12,9)
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+## Determine the soft-threshold to use for WGCNA 
+powers = c(c(1:10), seq(from = 11, to=30, by=1))
+sft = pickSoftThreshold(datExpr1, powerVector = powers, verbose = 5, networkType = "signed")
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+abline(h=0.8,col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+
+## Pick the soft threshold from the analysis above and find adjacency and TOM dissimilarity matrix 
+#for LYVE1- day 2: 12; LYVE1- day 7: 8; LYVE1+ day 2: 24; LYVE1+ day 7: 13; DC day 2: 12; DC day 7: 12
+softPower = 12;
+adjacency = adjacency(datExpr1, power = softPower, type = "signed")
+TOM = TOMsimilarity(adjacency, TOMType = "signed");
+dissTOM = 1-TOM
+
+## Create a clustering tree based on TOM dissimilarity matrix 
+TaxaTree = hclust(as.dist(dissTOM), method = "average")
+sizeGrWindow(12,9)
+plot(TaxaTree, xlab="", sub="", main = "Taxa clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04)
+
+## Pick a minimum module size and find modules of genes 
+minModuleSize = 10
+dynamicMods = cutreeDynamic(dendro = TaxaTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize);
+table(dynamicMods)
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+## plot the dendogram with module colors underneath it
+sizeGrWindow(8,6)
+plotDendroAndColors(TaxaTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Taxa dendrogram and module colors")
+
+## Find if further merging is possible using the dendogram for eigen genes
+MEList = moduleEigengenes(datExpr1, colors = dynamicColors)
+MEs = MEList$eigengenes
+MEDiss = 1-cor(MEs)
+METree = hclust(as.dist(MEDiss), method = "average")
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+
+MEDissThres = 0.30
+abline(h=MEDissThres, col = "red")
+merge = mergeCloseModules(datExpr1, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+
+geneTree = flashClust(as.dist(1-TOM),method="complete")
+#TOMplot(dissTOM^4, geneTree, as.character(mergedColors))
+
+## Verify if any modules were merged 
+sizeGrWindow(12, 9)
+plotDendroAndColors(TaxaTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+moduleColors = mergedColors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs
+GenesList <- as.list(strsplit(colnames(datExpr1), " "))
+ModuleLabelAssignment <- as.list(as.list(strsplit(moduleColors, " ")))
+MET = orderMEs(cbind(MEs))
+sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MET, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2), cex.lab = 0.8, xLabelsAngle
+= 90)
+
+
+## Save the result in a dataframe
+assignmentDf <- data.frame(matrix(ncol = 2, nrow = length(colnames(datExpr1))))
+x <- c("Genes", "ModuleAssignment")
+colnames(assignmentDf) <- x
+assignmentDf$Genes <- GenesList
+assignmentDf$ModuleAssignment <- ModuleLabelAssignment
+assignmentDf_DC_7 <- data.frame("Genes" = unlist(assignmentDf$Genes), "Module" = unlist(assignmentDf$ModuleAssignment))
+#setwd("C:/Users/stiwary/Documents")
+#write.csv(assignmentDf, "module_validate.csv")
+```
+
+#GO terms for each module for each cluster at each time point
+```{r}
+#make list of all of the clusters and modules at each time point
+modules <- list("LYVE1neg_2" = split(assignmentDf_LYVE1_2, assignmentDf_LYVE1_2$Module), 
+                "LYVE1neg_7" = split(assignmentDf_LYVE1_7, assignmentDf_LYVE1_7$Module),
+                "LYVE1pos_2" = split(assignmentDf_res_2, assignmentDf_res_2$Module), 
+                'LYVE1pos_7' = list(assignmentDf_res_7),
+                "DC_2" = split(assignmentDf_DC_2, assignmentDf_DC_2$Module), 
+                'DC_7' = split(assignmentDf_DC_7, assignmentDf_DC_7$Module)
+                )
+
+saveRDS(modules, "WGCNA_modules_3clus_bothdays.R")
+for(i in 1:length(modules$LYVE1neg_2)){
+        write.xlsx(modules$LYVE1neg_2[i], file = paste(i, "modules_LYVE1neg_2.xlsx"))
+}
+
+
+for(i in 1:length(modules)){
+write.xlsx(modules[[i]], file=paste(names(modules[i]),'_modules.xlsx'), append = T)
+}
+
+#now GO for each module in each cluster at each time point fml
+modules_GO <- lapply(modules, function(x){
+        lapply(x, function(y){
+#just get the vector of geneIDs
+genelist <- y$Genes
+
+#if don't have enough genes then don't do a meaningful GO. Otherwise do a GO
+if(length(genelist) < 6) {return(NA)}
+translated <- bitr(genelist, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+IDs <- translated$ENTREZID
+
+GO <- enrichGO(gene = IDs, 
+               ont = "BP", 
+               qvalueCutoff = 0.05, 
+               OrgDb = org.Mm.eg.db, 
+               minGSSize = 10, 
+               maxGSSize = 10000)
+
+#select for terms that are significant and that have good number of genes from the cluster mapped to them (to get the terms that apply to a majority of the genes)
+GO@result <- subset(GO, GO@result$p.adjust < 0.05)
+
+#if don't have lots of GO terms then no need to simplify. Otherwise simplify
+if(length(rownames(GO@result)) <= 2) {return("GO terms" = GO)}
+
+GO <- dropGO(GO, level = 1:3)
+GO <- simplify(GO)
+simMatrix <- calculateSimMatrix(GO@result$ID, org.Mm.eg.db, ont = "BP", method = "Wang")
+scores <- setNames(-log10(GO@result$qvalue), GO@result$ID)
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold=0.95,
+                                orgdb="org.Mm.eg.db")
+GO@result <- merge(GO@result, reducedTerms, by.x = "ID", by.y = "go")
+
+return(list("GO terms" = GO))
+        } 
+     )
+  }
+)
+
+saveRDS(modules_GO, "WGCNA_modules_GO.R")
+
+```
+
