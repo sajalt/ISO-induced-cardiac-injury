@@ -1,6 +1,6 @@
 ---
-title: "WGCNA Sandeep scripted edited"
-author: "Sajal Tiwary"
+title: "WGCNA script edited"
+author: 
 date: "8/23/2021"
 output: html_document
 ---
@@ -20,7 +20,7 @@ library(rrvgo)
 
 #data entry and cleaning
 ```{r}
-setwd("C:/Users/stiwary/Documents")
+setwd("C:/Users/Documents")
 heart_DEGs <- readRDS('heart_DEGs.rds')
 counts <- readRDS('counts_by_cluster.rds')
 
